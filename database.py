@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import func
 import json
 from typing import List, Dict, Optional
+import uuid
 
 # SQLite database URL
 DATABASE_URL = "sqlite+aiosqlite:///document_agents.db"
@@ -40,6 +41,30 @@ class Chunk(Base):
     
     # Relationship to document
     document = relationship("Document", back_populates="chunks")
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    
+    # Relationship to messages
+    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+
+class Message(Base):
+    __tablename__ = "messages"
+    
+    id = Column(String, primary_key=True)
+    conversation_id = Column(String, ForeignKey("conversations.id"), nullable=False)
+    role = Column(String, nullable=False)  # 'user', 'assistant', or 'system'
+    content = Column(Text, nullable=False)
+    msg_metadata = Column(Text)  # JSON string for additional data like sources, validation, etc.
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    
+    # Relationship to conversation
+    conversation = relationship("Conversation", back_populates="messages")
 
 async def init_db():
     async with engine.begin() as conn:
@@ -128,4 +153,68 @@ async def get_document_chunks(doc_id: str):
                 "metadata": json.loads(chunk.chunk_metadata) if chunk.chunk_metadata else {}
             }
             for chunk in chunks
+        ]
+
+async def create_conversation(title: str) -> str:
+    """Create a new conversation and return its ID."""
+    conversation_id = str(uuid.uuid4())
+    async with async_session() as session:
+        new_conversation = Conversation(id=conversation_id, title=title)
+        session.add(new_conversation)
+        await session.commit()
+    return conversation_id
+
+async def add_message(conversation_id: str, role: str, content: str, metadata: Optional[Dict] = None) -> str:
+    """Add a message to a conversation and return its ID."""
+    message_id = str(uuid.uuid4())
+    metadata_str = json.dumps(metadata) if metadata else None
+    
+    async with async_session() as session:
+        new_message = Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            msg_metadata=metadata_str
+        )
+        session.add(new_message)
+        await session.commit()
+    
+    return message_id
+
+async def get_conversation_messages(conversation_id: str) -> List[Dict]:
+    """Get all messages for a specific conversation."""
+    async with async_session() as session:
+        from sqlalchemy import select
+        query = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+        result = await session.execute(query)
+        messages = result.scalars().all()
+        
+        return [
+            {
+                "id": message.id,
+                "role": message.role,
+                "content": message.content,
+                "metadata": json.loads(message.msg_metadata) if message.msg_metadata else None,
+                "created_at": message.created_at.isoformat() if message.created_at else None
+            }
+            for message in messages
+        ]
+
+async def get_conversations() -> List[Dict]:
+    """Get all conversations."""
+    async with async_session() as session:
+        from sqlalchemy import select
+        query = select(Conversation).order_by(Conversation.updated_at.desc())
+        result = await session.execute(query)
+        conversations = result.scalars().all()
+        
+        return [
+            {
+                "id": conversation.id,
+                "title": conversation.title,
+                "created_at": conversation.created_at.isoformat() if conversation.created_at else None,
+                "updated_at": conversation.updated_at.isoformat() if conversation.updated_at else None
+            }
+            for conversation in conversations
         ]

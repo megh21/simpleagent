@@ -9,6 +9,8 @@ from langchain_openai import AzureChatOpenAI
 from document_processor import query_documents
 from langchain.schema import SystemMessage, HumanMessage
 from web_search import search_duckduckgo, fetch_webpage_content
+from memory import SQLAlchemyConversationMemory
+from database import add_message
 
 # Initialize Azure OpenAI LLM
 llm = AzureChatOpenAI(
@@ -46,8 +48,9 @@ class AgentTools:
         )
 
 # Add a new function to create a web search agent
-def create_web_search_agent():
+def create_web_search_agent(conversation_id: Optional[str] = None):
     tools = AgentTools([])  # No doc_ids needed for web search
+    memory = SQLAlchemyConversationMemory(conversation_id=conversation_id) if conversation_id else None
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a web research agent specialized in finding information from the internet.
@@ -56,14 +59,16 @@ def create_web_search_agent():
         Always cite your sources when providing information from the web.
         """),
         ("human", "{input}"),
+        ("ai", "{agent_scratchpad}")
     ])
     
     agent = create_openai_tools_agent(llm, [tools.get_web_search_tool()], prompt)
-    return AgentExecutor(agent=agent, tools=[tools.get_web_search_tool()], verbose=True)
+    return AgentExecutor(agent=agent, tools=[tools.get_web_search_tool()], memory=memory, verbose=True)
 
 
-def create_research_agent(doc_ids: List[str]):
+def create_research_agent(doc_ids: List[str], conversation_id: Optional[str] = None):
     tools = AgentTools(doc_ids)
+    memory = SQLAlchemyConversationMemory(conversation_id=conversation_id) if conversation_id else None
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a research agent specialized in finding information from documents.
@@ -71,46 +76,50 @@ def create_research_agent(doc_ids: List[str]):
         Be thorough and precise in your research, focusing on finding the most relevant facts and details.
         """),
         ("human", "{input}"),
-        ("ai", "{agent_scratchpad}")  # Add this missing variable
+        ("ai", "{agent_scratchpad}")
     ])
     
     agent = create_openai_tools_agent(llm, [tools.get_search_tool()], prompt)
-    return AgentExecutor(agent=agent, tools=[tools.get_search_tool()], verbose=True)
+    return AgentExecutor(agent=agent, tools=[tools.get_search_tool()], memory=memory, verbose=True)
 
-def create_writing_agent():
+def create_writing_agent(conversation_id: Optional[str] = None):
+    memory = SQLAlchemyConversationMemory(conversation_id=conversation_id) if conversation_id else None
+    
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a writing agent specialized in crafting clear, concise, and informative responses.
         Your task is to take information provided by other agents and turn it into a well-structured response.
         Focus on clarity, accuracy, and providing a comprehensive answer to the user's query.
         """),
         ("human", "{input}"),
-        ("ai", "{agent_scratchpad}")  # Add this missing variable
+        ("ai", "{agent_scratchpad}")
     ])
     
     agent = create_openai_tools_agent(llm, [], prompt)
-    return AgentExecutor(agent=agent, tools=[], verbose=True)
+    return AgentExecutor(agent=agent, tools=[], memory=memory, verbose=True)
 
-def create_validation_agent():
+def create_validation_agent(conversation_id: Optional[str] = None):
+    memory = SQLAlchemyConversationMemory(conversation_id=conversation_id) if conversation_id else None
+    
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a validation agent specialized in fact-checking and ensuring accuracy.
         Your task is to review information and answers, checking for inconsistencies, gaps, or errors.
         Provide feedback on the completeness and accuracy of the information.
         """),
         ("human", "{input}"),
-        ("ai", "{agent_scratchpad}")  # Add this missing variable
+        ("ai", "{agent_scratchpad}")
     ])
     
     agent = create_openai_tools_agent(llm, [], prompt)
-    return AgentExecutor(agent=agent, tools=[], verbose=True)
+    return AgentExecutor(agent=agent, tools=[], memory=memory, verbose=True)
 
 # Execute agents in parallel
-# Update the execute_agents_parallel function to include web search
-async def execute_agents_parallel(query: str, doc_ids: Optional[List[str]] = None, include_web_search: bool = False):
+# Update the execute_agents_parallel function to include web search and conversation context
+async def execute_agents_parallel(query: str, doc_ids: Optional[List[str]] = None, include_web_search: bool = False, conversation_id: Optional[str] = None):
     tasks = []
     
     # If document IDs are provided, run document research
     if doc_ids and len(doc_ids) > 0:
-        research_agent = create_research_agent(doc_ids)
+        research_agent = create_research_agent(doc_ids, conversation_id)
         research_task = asyncio.create_task(
             research_agent.ainvoke({"input": f"Find information related to: {query}"})
         )
@@ -118,7 +127,7 @@ async def execute_agents_parallel(query: str, doc_ids: Optional[List[str]] = Non
     
     # If web search is requested, run web research
     if include_web_search:
-        web_agent = create_web_search_agent()
+        web_agent = create_web_search_agent(conversation_id)
         web_task = asyncio.create_task(
             web_agent.ainvoke({"input": f"Search the web for information about: {query}"})
         )
@@ -138,11 +147,29 @@ async def execute_agents_parallel(query: str, doc_ids: Optional[List[str]] = Non
         combined_research += f"WEB SOURCES:\n{research_results['web_research']}\n\n"
     
     if not combined_research:
-        return {"answer": "No sources available for research. Please select at least one document or enable web search.", "sources": []}
+        response = {"answer": "No sources available for research. Please select at least one document or enable web search.", "sources": []}
+        
+        # Save to conversation history if conversation_id is provided
+        if conversation_id:
+            # Save the user message
+            await add_message(
+                conversation_id=conversation_id,
+                role="user",
+                content=query
+            )
+            
+            # Save the assistant response
+            await add_message(
+                conversation_id=conversation_id,
+                role="assistant",
+                content=response["answer"]
+            )
+        
+        return response
     
     # Execute writing and validation agents
-    writing_agent = create_writing_agent()
-    validation_agent = create_validation_agent()
+    writing_agent = create_writing_agent(conversation_id)
+    validation_agent = create_validation_agent(conversation_id)
     
     writing_task = asyncio.create_task(
         writing_agent.ainvoke({
@@ -204,8 +231,30 @@ async def execute_agents_parallel(query: str, doc_ids: Optional[List[str]] = Non
             except:
                 pass
     
-    return {
+    result = {
         "answer": answer,
         "validation": validation,
         "sources": sources
     }
+    
+    # Save to conversation history if conversation_id is provided
+    if conversation_id:
+        # Save the user message
+        await add_message(
+            conversation_id=conversation_id,
+            role="user",
+            content=query
+        )
+        
+        # Save the assistant response
+        await add_message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=answer,
+            metadata={
+                "validation": validation,
+                "sources": sources
+            }
+        )
+    
+    return result

@@ -5,11 +5,25 @@ from typing import List, Optional
 import uvicorn
 import os
 import uuid
-from database import init_db, add_document, get_document, get_all_documents
+from contextlib import asynccontextmanager
+from database import init_db, add_document, get_document, get_all_documents, create_conversation, add_message, get_conversation_messages, get_conversations
 from document_processor import process_document, query_documents
 from agents import execute_agents_parallel
+from schemas import CreateConversationRequest, ConversationMessageRequest
 
-app = FastAPI()
+# Create uploads directory if it doesn't exist
+os.makedirs("uploads", exist_ok=True)
+
+# Define lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: initialize database
+    await init_db()
+    yield
+    # Shutdown: perform cleanup if needed
+    pass
+
+app = FastAPI(lifespan=lifespan)
 
 # CORS middleware
 app.add_middleware(
@@ -19,14 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Create uploads directory if it doesn't exist
-os.makedirs("uploads", exist_ok=True)
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_db_client():
-    await init_db()
 
 class QueryRequest(BaseModel):
     query: str
@@ -70,6 +76,7 @@ class CombinedQueryRequest(BaseModel):
     doc_ids: Optional[List[str]] = None
     include_web_search: bool = False
 
+
 @app.post("/combined-query")
 async def combined_query(request: CombinedQueryRequest):
     # Execute agents to analyze documents and web, and answer the query
@@ -77,6 +84,32 @@ async def combined_query(request: CombinedQueryRequest):
         request.query, 
         request.doc_ids, 
         request.include_web_search
+    )
+    return result
+
+@app.post("/conversations")
+async def create_new_conversation(request: CreateConversationRequest):
+    conversation_id = await create_conversation(request.title)
+    return {"conversation_id": conversation_id, "title": request.title}
+
+@app.get("/conversations")
+async def list_conversations():
+    conversations = await get_conversations()
+    return {"conversations": conversations}
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    messages = await get_conversation_messages(conversation_id)
+    return {"messages": messages}
+
+@app.post("/conversations/{conversation_id}/messages")
+async def add_message_to_conversation(conversation_id: str, request: ConversationMessageRequest):
+    # Execute agents with the conversation context
+    result = await execute_agents_parallel(
+        request.query, 
+        request.doc_ids, 
+        request.include_web_search,
+        conversation_id
     )
     return result
 
